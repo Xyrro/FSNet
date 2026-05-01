@@ -1,9 +1,9 @@
 import numpy as np
 import pickle
 import time
-import os 
+import os
 from typing import Dict, Tuple
-# import wandb 
+import wandb
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,8 +15,13 @@ from utils.optimization_utils import *
 from utils.lbfgs import nondiff_lbfgs_solve, hybrid_lbfgs_solve
 from models.neural_networks import MLP
 
-DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-torch.set_default_dtype(torch.float64)
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
+torch.set_default_dtype(torch.float32)
 
 
 def load_instance(config):
@@ -344,20 +349,43 @@ class Trainer:
  
     def train(self):
         """Main training loop with detailed results collection."""
-        train_loader = DataLoader(
-            self.data.train_dataset, 
-            batch_size=self.config['batch_size'], 
-            shuffle=True, 
+        # ── W&B initialisation ─────────────────────────────────────────────
+        run_name = f"{self.method}_{self.config['prob_type']}_{self.config['prob_name']}_seed{self.config['seed']}"
+        wandb.init(
+            entity="VipOpf",
+            project="ML4OPF",
+            name=run_name,
+            config={
+                # training
+                "method":     self.method,
+                "prob_type":  self.config["prob_type"],
+                "prob_name":  self.config["prob_name"],
+                "seed":       self.config["seed"],
+                "num_epochs": self.config["num_epochs"],
+                "batch_size": self.config["batch_size"],
+                "lr":         self.config["lr"],
+                "hidden_dim": self.config["hidden_dim"],
+                "num_layers": self.config["num_layers"],
+                # method-specific
+                **self.config.get(self.method, {}),
+            },
         )
-        
+
+        train_loader = DataLoader(
+            self.data.train_dataset,
+            batch_size=self.config['batch_size'],
+            shuffle=True,
+        )
+
         val_loader = DataLoader(
-            self.data.val_dataset, 
-            batch_size=self.config['batch_size'], 
+            self.data.val_dataset,
+            batch_size=self.config['batch_size'],
             shuffle=False
         )
-        
+
         # Initialize model
         self.model = create_model(self.data, self.method, self.config)
+        wandb.watch(self.model, log="gradients", log_freq=100)
         
         # Initialize optimizer and scheduler (fix the initialization issue)
         self.optimizer = optim.AdamW(
@@ -387,7 +415,7 @@ class Trainer:
             train_history.append({'epoch': epoch, **epoch_metrics})
             epoch_end = time.time()
        
-            # Log metrics
+            # Log metrics to console
             print(f"Epoch {epoch + 1}/{self.config['num_epochs']}, "
                   f"Loss: {epoch_metrics['loss']:.4f}, "
                   f"Obj: {epoch_metrics.get('obj', 0):.4f}, "
@@ -395,11 +423,37 @@ class Trainer:
                   f"Ineq Viol (l1): {epoch_metrics.get('ineq_violation_l1', 0):.6f}, "
                   f"Epoch time: {epoch_end - epoch_start:.2f}s")
 
+            # Log train metrics to W&B
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss":              epoch_metrics["loss"],
+                "train/obj":               epoch_metrics.get("obj", 0),
+                "train/eq_violation_l1":   epoch_metrics.get("eq_violation_l1", 0),
+                "train/ineq_violation_l1": epoch_metrics.get("ineq_violation_l1", 0),
+                "train/eq_violation_l2":   epoch_metrics.get("eq_violation", 0),
+                "train/ineq_violation_l2": epoch_metrics.get("ineq_violation", 0),
+                "train/distance":          epoch_metrics.get("distance", 0),
+                "train/epoch_time_s":      epoch_end - epoch_start,
+                "lr": self.optimizer.param_groups[0]["lr"],
+            }, step=epoch + 1)
+
             # Evaluate on validation set
             if (epoch + 1) % self.config['eval_step'] == 0:
                 print(f"\nRunning validation at epoch {epoch + 1}...")
                 val_metrics = self.evaluator.evaluate(self.model, val_loader, f"validation_epoch_{epoch+1}")
                 val_history.append({**val_metrics, 'epoch': epoch})
+
+                # Log val metrics to W&B
+                wandb.log({
+                    "epoch": epoch + 1,
+                    "val/obj":                    val_metrics.get("objective", 0),
+                    "val/opt_gap":                val_metrics.get("opt_gap_mean", 0),
+                    "val/eq_violation_l1":        val_metrics.get("eq_violation_l1_mean", 0),
+                    "val/ineq_violation_l1":      val_metrics.get("ineq_violation_l1_mean", 0),
+                    "val/eq_violation_l1_max":    val_metrics.get("eq_violation_l1_max", 0),
+                    "val/ineq_violation_l1_max":  val_metrics.get("ineq_violation_l1_max", 0),
+                    "val/solution_distance":      val_metrics.get("solution_distance_mean", 0),
+                }, step=epoch + 1)
         
         train_end = time.time()
         training_time = train_end - train_start
@@ -437,12 +491,27 @@ class Trainer:
         # Save all results with detailed information
         if self.save_dir:
             self._save_model_and_results(
-                train_history, 
-                val_history, 
-                final_test_results, 
+                train_history,
+                val_history,
+                final_test_results,
                 training_time
             )
-        
+
+        # Log final test metrics to W&B and finish run
+        for bs, result in final_test_results.get("batch_size_comparison", {}).items():
+            if "error" not in result:
+                m = result["metrics"]
+                wandb.log({
+                    f"test_bs{bs}/obj":               m.get("objective", 0),
+                    f"test_bs{bs}/opt_gap":           m.get("opt_gap_mean", 0),
+                    f"test_bs{bs}/eq_violation_l1":   m.get("eq_violation_l1_mean", 0),
+                    f"test_bs{bs}/ineq_violation_l1": m.get("ineq_violation_l1_mean", 0),
+                    f"test_bs{bs}/inference_time_s":  m.get("total_time", 0),
+                })
+
+        wandb.summary["training_time_s"] = training_time
+        wandb.finish()
+
         return self.model
     
     
